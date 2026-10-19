@@ -31,6 +31,21 @@ export interface CalendarEvent {
   [key: string]: any;
 }
 
+/** How an alternate date is shown: numeric day/month or day and month name. */
+export type AlternateCalendarFormat = "d/m" | "d_month";
+
+/**
+ * A date for the same event in an alternate calendar system, for example the
+ * Hijri, Hebrew, or Chinese calendar.
+ */
+export interface AlternateDate {
+  calendar_type: string;
+  display_name: string;
+  date_str: string;
+  calendar_name?: string;
+  metadata?: Record<string, unknown>;
+}
+
 /** Data returned from the core APIs. */
 export interface CalendarEventData {
   uid?: string;
@@ -43,6 +58,7 @@ export interface CalendarEventData {
   location?: string;
   // No status means none was reported, which is not the same as confirmed
   status?: "confirmed" | "tentative";
+  alternate_dates?: AlternateDate[];
 }
 
 export interface CalendarEventMutableParams {
@@ -221,6 +237,7 @@ export interface CalendarEventApiData {
   rrule?: string | null;
   status?: "confirmed" | "tentative" | null;
   all_day?: boolean;
+  alternate_dates?: AlternateDate[] | null;
 }
 
 export interface CalendarEventSubscription {
@@ -283,6 +300,7 @@ export const normalizeSubscriptionEventData = (
     recurrence_id: eventData.recurrence_id ?? undefined,
     rrule: eventData.rrule ?? undefined,
     status: eventData.status ?? undefined,
+    alternate_dates: eventData.alternate_dates ?? undefined,
   };
 
   return {

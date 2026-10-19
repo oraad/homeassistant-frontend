@@ -1,5 +1,13 @@
 import { describe, expect, it } from "vitest";
-import { getCalendarColors } from "../../src/data/calendar";
+import {
+  getCalendarColors,
+  normalizeSubscriptionEventData,
+} from "../../src/data/calendar";
+import type {
+  AlternateDate,
+  Calendar,
+  CalendarEventApiData,
+} from "../../src/data/calendar";
 
 const style = {
   getPropertyValue: (prop: string) => (prop === "--color-1" ? "#4269d0" : ""),
@@ -54,5 +62,59 @@ describe("getCalendarColors", () => {
     expect(
       getCalendarColors("rgba(255, 255, 255, 0.1)", 0, style).textColor
     ).toBeUndefined();
+  });
+});
+
+describe("normalizeSubscriptionEventData", () => {
+  const calendar: Calendar = { entity_id: "calendar.test" };
+
+  const baseEvent: CalendarEventApiData = {
+    summary: "Eid al-Fitr",
+    start: "2025-04-01T00:00:00",
+    end: "2025-04-01T01:00:00",
+  };
+
+  const alternateDates: AlternateDate[] = [
+    {
+      calendar_type: "hijri",
+      display_name: "Hijri",
+      date_str: "1446-10-01",
+      metadata: { year: 1446, month: 10, day: 1 },
+    },
+    {
+      calendar_type: "hebrew",
+      display_name: "Hebrew",
+      date_str: "5785-13-03",
+    },
+  ];
+
+  it("carries alternate_dates from the API data onto the event data", () => {
+    const event = normalizeSubscriptionEventData(
+      { ...baseEvent, alternate_dates: alternateDates },
+      calendar
+    );
+
+    expect(event?.eventData.alternate_dates).toEqual(alternateDates);
+  });
+
+  it.each([undefined, null])(
+    "normalizes %s alternate_dates to undefined",
+    (alternateDatesValue) => {
+      const event = normalizeSubscriptionEventData(
+        { ...baseEvent, alternate_dates: alternateDatesValue },
+        calendar
+      );
+
+      expect(event?.eventData.alternate_dates).toBeUndefined();
+    }
+  );
+
+  it("preserves an empty alternate_dates array", () => {
+    const event = normalizeSubscriptionEventData(
+      { ...baseEvent, alternate_dates: [] },
+      calendar
+    );
+
+    expect(event?.eventData.alternate_dates).toEqual([]);
   });
 });
