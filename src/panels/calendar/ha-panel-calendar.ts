@@ -1,12 +1,16 @@
 import "@home-assistant/webawesome/dist/components/divider/divider";
 import { ResizeController } from "@lit-labs/observers/resize-controller";
-import { mdiChevronDown, mdiPlus, mdiRefresh } from "@mdi/js";
+import { mdiCalendarSync, mdiChevronDown, mdiPlus, mdiRefresh } from "@mdi/js";
 import type { UnsubscribeFunc } from "home-assistant-js-websocket";
 import type { CSSResultGroup, TemplateResult } from "lit";
 import { LitElement, css, html, nothing } from "lit";
 import { customElement, property, state } from "lit/decorators";
 import { storage } from "../../common/decorators/storage";
-import type { HASSDomEvent } from "../../common/dom/fire_event";
+import type {
+  HASSDomCurrentTargetEvent,
+  HASSDomEvent,
+} from "../../common/dom/fire_event";
+import { capitalizeFirstLetter } from "../../common/string/capitalize-first-letter";
 import "../../components/ha-button";
 import "../../components/ha-card";
 import "../../components/ha-dropdown";
@@ -20,6 +24,7 @@ import "../../components/ha-state-icon";
 import "../../components/ha-svg-icon";
 import "../../components/ha-two-pane-top-app-bar-fixed";
 import type {
+  AlternateCalendarFormat,
   Calendar,
   CalendarEvent,
   CalendarEventApiData,
@@ -64,6 +69,22 @@ class PanelCalendar extends SubscribeMixin(LitElement) {
     state: true,
   })
   private _deSelectedCalendars: string[] = [];
+
+  @state()
+  @storage({
+    key: "alternateCalendarTypes",
+    state: true,
+  })
+  private _alternateCalendarTypes?: string[];
+
+  @state() private _alternateCalendarNames: Record<string, string> = {};
+
+  @state()
+  @storage({
+    key: "alternateCalendarFormat",
+    state: true,
+  })
+  private _alternateCalendarFormat: AlternateCalendarFormat = "d/m";
 
   private _start?: Date;
 
@@ -192,6 +213,56 @@ class PanelCalendar extends SubscribeMixin(LitElement) {
           @click=${this._handleRefresh}
         ></ha-icon-button>
         ${
+          this._availableAlternateCalendarTypes.length
+            ? html`<ha-dropdown
+                slot="actionItems"
+                class="alternate-calendar-menu"
+              >
+                <ha-icon-button
+                  slot="trigger"
+                  .path=${mdiCalendarSync}
+                  .label=${this.hass.localize(
+                    "ui.components.calendar.alternate_dates"
+                  )}
+                ></ha-icon-button>
+                ${this._availableAlternateCalendarTypes.map(
+                  ({ type, name }) =>
+                    html`<ha-dropdown-item
+                      type="checkbox"
+                      .value=${type}
+                      .checked=${this._isAlternateCalendarTypeEnabled(type)}
+                      @click=${this._toggleAlternateCalendarType}
+                    >
+                      <ha-svg-icon
+                        slot="icon"
+                        .path=${mdiCalendarSync}
+                      ></ha-svg-icon>
+                      ${name}
+                    </ha-dropdown-item>`
+                )}
+                <wa-divider></wa-divider>
+                <ha-dropdown-item
+                  .value=${"d/m"}
+                  .selected=${this._alternateCalendarFormat === "d/m"}
+                  @click=${this._selectAlternateCalendarFormat}
+                >
+                  ${this.hass.localize(
+                    "ui.components.calendar.alternate_format_dm"
+                  )}
+                </ha-dropdown-item>
+                <ha-dropdown-item
+                  .value=${"d_month"}
+                  .selected=${this._alternateCalendarFormat === "d_month"}
+                  @click=${this._selectAlternateCalendarFormat}
+                >
+                  ${this.hass.localize(
+                    "ui.components.calendar.alternate_format_dmonth"
+                  )}
+                </ha-dropdown-item>
+              </ha-dropdown>`
+            : nothing
+        }
+        ${
           showPane
             ? html`<ha-list slot="pane" multi>${calendarItems}</ha-list>${
                   this.hass.user?.is_admin
@@ -218,9 +289,14 @@ class PanelCalendar extends SubscribeMixin(LitElement) {
           .calendars=${this._calendars}
           .narrow=${this.narrow}
           .initialView=${this.narrow ? "listWeek" : "dayGridMonth"}
+          .alternateCalendarTypes=${this._alternateCalendarTypes}
+          .alternateCalendarFormat=${this._alternateCalendarFormat}
           .hass=${this.hass}
           .error=${this._error}
           @view-changed=${this._handleViewChanged}
+          @alternate-calendar-names-changed=${
+            this._handleAlternateCalendarNamesChanged
+          }
         ></ha-full-calendar>
       </ha-two-pane-top-app-bar-fixed>
     `;
@@ -230,6 +306,35 @@ class PanelCalendar extends SubscribeMixin(LitElement) {
     return this._calendars
       .filter((selCal) => !this._deSelectedCalendars.includes(selCal.entity_id))
       .map((cal) => cal);
+  }
+
+  // Alternate calendars are declared by the calendar entities themselves, so
+  // the offered types do not depend on which calendars are currently selected
+  // for display.
+  private get _availableAlternateCalendarTypes(): {
+    type: string;
+    name: string;
+  }[] {
+    const types = new Map<string, string>();
+    this._calendars.forEach((calendar) => {
+      const stateObj = this.hass.states[calendar.entity_id];
+      if (!stateObj) {
+        return;
+      }
+      const supportedTypes = stateObj.attributes.supported_alternate_calendars;
+      if (!Array.isArray(supportedTypes)) {
+        return;
+      }
+      supportedTypes.forEach((type) => {
+        if (typeof type === "string" && !types.has(type)) {
+          types.set(
+            type,
+            this._alternateCalendarNames[type] || capitalizeFirstLetter(type)
+          );
+        }
+      });
+    });
+    return [...types].map(([type, name]) => ({ type, name }));
   }
 
   private _subscribeCalendarEvents(calendars: Calendar[]): void {
@@ -346,6 +451,39 @@ class PanelCalendar extends SubscribeMixin(LitElement) {
     }
   }
 
+  private _isAlternateCalendarTypeEnabled(type: string): boolean {
+    return (
+      this._alternateCalendarTypes === undefined ||
+      this._alternateCalendarTypes.includes(type)
+    );
+  }
+
+  private _toggleAlternateCalendarType(
+    ev: HASSDomCurrentTargetEvent<HaDropdownItem>
+  ): void {
+    ev.stopPropagation();
+    const type = ev.currentTarget.value;
+    const current =
+      this._alternateCalendarTypes ??
+      this._availableAlternateCalendarTypes.map((entry) => entry.type);
+    this._alternateCalendarTypes = current.includes(type)
+      ? current.filter((entry) => entry !== type)
+      : [...current, type];
+  }
+
+  private _handleAlternateCalendarNamesChanged(
+    ev: HASSDomEvent<HASSDomEvents["alternate-calendar-names-changed"]>
+  ): void {
+    this._alternateCalendarNames = ev.detail.value;
+  }
+
+  private _selectAlternateCalendarFormat(
+    ev: HASSDomCurrentTargetEvent<HaDropdownItem>
+  ): void {
+    const format = ev.currentTarget.value as AlternateCalendarFormat;
+    this._alternateCalendarFormat = format;
+  }
+
   private _addCalendar = async (): Promise<void> => {
     showConfigFlowDialog(this, {
       startFlowHandler: "local_calendar",
@@ -397,6 +535,14 @@ class PanelCalendar extends SubscribeMixin(LitElement) {
       css`
         :host {
           display: block;
+        }
+        wa-divider {
+          margin: var(--ha-space-1) 0;
+        }
+        /* The menu sizes to its content, which leaves short labels cramped
+           next to the trigger. Give the items a comfortable minimum width. */
+        .alternate-calendar-menu ha-dropdown-item {
+          min-width: 220px;
         }
         ha-full-calendar {
           --calendar-header-padding: 12px;

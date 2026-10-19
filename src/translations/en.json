@@ -1390,6 +1390,9 @@
         "create_calendar": "Create calendar",
         "today": "Today",
         "event_retrieval_error": "Could not retrieve events for calendars",
+        "alternate_dates": "Alternate dates",
+        "alternate_format_dm": "Numeric",
+        "alternate_format_dmonth": "Named",
         "event": {
           "add": "Add event",
           "delete": "Delete event",
