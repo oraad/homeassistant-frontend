@@ -1,5 +1,9 @@
 import { TZDate } from "@date-fns/tz";
-import type { CalendarOptions } from "@fullcalendar/core";
+import type {
+  CalendarOptions,
+  DayCellMountArg,
+  DayHeaderMountArg,
+} from "@fullcalendar/core";
 import { Calendar } from "@fullcalendar/core";
 import allLocales from "@fullcalendar/core/locales-all";
 import dayGridPlugin from "@fullcalendar/daygrid";
@@ -29,6 +33,8 @@ import "../../components/ha-button-toggle-group";
 import "../../components/ha-icon-button-next";
 import "../../components/ha-icon-button-prev";
 import type {
+  AlternateCalendarFormat,
+  AlternateDate,
   Calendar as CalendarData,
   CalendarEvent,
 } from "../../data/calendar";
@@ -51,8 +57,11 @@ declare global {
   }
   interface HASSDomEvents {
     "view-changed": CalendarViewChanged;
+    "alternate-calendar-names-changed": { value: Record<string, string> };
   }
 }
+
+const MS_PER_DAY = 86_400_000;
 
 const defaultFullCalendarConfig: CalendarOptions = {
   headerToolbar: false,
@@ -103,6 +112,25 @@ export class HAFullCalendar extends LitElement {
 
   @property({ attribute: false }) public error?: string = undefined;
 
+  /**
+   * Alternate calendar types whose dates should be shown.
+   * `undefined` means the user made no explicit choice, so every type carried
+   * by the alternate dates is shown.
+   */
+  @property({ attribute: false }) public alternateCalendarTypes?: string[];
+
+  @property({ attribute: false })
+  public alternateCalendarFormat: AlternateCalendarFormat = "d/m";
+
+  private _alternateCalendarNames: Record<string, string> = {};
+
+  /** Replaced wholesale when the loaded range changes. */
+  private _alternateDateCache: Record<string, AlternateDate[]> = {};
+
+  private _alternateDateRange?: string;
+
+  private _alternateDatesRetryTimeouts: number[] = [];
+
   private calendar?: Calendar;
 
   private _midnightRefreshTimeout?: number;
@@ -120,6 +148,7 @@ export class HAFullCalendar extends LitElement {
 
   disconnectedCallback(): void {
     this._clearMidnightRefreshTimeout();
+    this._clearAlternateDatesRetries();
     super.disconnectedCallback();
     this.calendar?.destroy();
     this.calendar = undefined;
@@ -299,9 +328,20 @@ export class HAFullCalendar extends LitElement {
       return;
     }
 
+    if (
+      changedProps.has("alternateCalendarTypes") ||
+      changedProps.has("alternateCalendarFormat")
+    ) {
+      this._applyAlternateDatesToDom();
+    }
+
     if (changedProps.has("events")) {
       this.calendar.removeAllEventSources();
       this.calendar.addEventSource(this.events);
+    }
+
+    if (changedProps.has("hass")) {
+      this._loadAlternateDates();
     }
 
     if (changedProps.has("views") && !this.views.includes(this._activeView!)) {
@@ -367,6 +407,11 @@ export class HAFullCalendar extends LitElement {
     config.eventDidMount = ({ el, event }) => {
       el.style.setProperty("--event-color", event.borderColor);
       el.style.setProperty("--event-text-color", event.textColor);
+    };
+    config.dayCellDidMount = (arg) => this._appendAlternateDayCellDate(arg);
+    config.dayHeaderDidMount = (arg) => this._appendAlternateDayHeaderDate(arg);
+    config.datesSet = (arg) => {
+      this._loadAlternateDates(arg.start, arg.end);
     };
 
     this.calendar = new Calendar(
@@ -536,6 +581,254 @@ export class HAFullCalendar extends LitElement {
       month: "2-digit",
       day: "2-digit",
     }).format(date);
+  }
+
+  private async _loadAlternateDates(
+    rangeStart?: Date,
+    rangeEnd?: Date
+  ): Promise<void> {
+    const { hass, calendar } = this;
+    if (!hass || !calendar) {
+      return;
+    }
+    // Prefer the range supplied by datesSet: calendar.view can still describe
+    // the previous view while the callback runs.
+    const start = rangeStart ?? calendar.view?.currentStart;
+    const end = rangeEnd ?? calendar.view?.currentEnd;
+    if (!start || !end) {
+      return;
+    }
+    // currentStart/currentEnd bound the month, not the visible grid, which also
+    // shows leading and trailing days from the adjacent months. Pad by a week
+    // so those cells have dates too.
+    const pad = 7 * MS_PER_DAY;
+    const startKey = this._dateKey(new Date(start.getTime() - pad));
+    const endKey = this._dateKey(new Date(end.getTime() - MS_PER_DAY + pad));
+    const rangeKey = `${startKey}/${endKey}`;
+    if (rangeKey === this._alternateDateRange) {
+      return;
+    }
+    try {
+      const result = await hass.callWS<Record<string, AlternateDate[]>>({
+        type: "calendar/alternate_dates",
+        start: startKey,
+        end: endKey,
+      });
+      this._alternateDateRange = rangeKey;
+      this._alternateDateCache = result;
+      const names: Record<string, string> = {};
+      for (const date of Object.values(result).flat()) {
+        if (date.calendar_name) {
+          names[date.calendar_type] = date.calendar_name;
+        }
+      }
+      this._alternateCalendarNames = names;
+      fireEvent(this, "alternate-calendar-names-changed", { value: names });
+      // dayCellDidMount has already run for the visible cells with an empty
+      // cache. Apply the freshly loaded dates to the rendered DOM rather than
+      // relying on a re-render to re-run those mount hooks.
+      this._applyAlternateDatesToDomWithRetries();
+    } catch {
+      this._alternateDateCache = {};
+    }
+  }
+
+  private _applyAlternateDatesToDom(): void {
+    const root = this.shadowRoot;
+    if (!root) {
+      return;
+    }
+    if (this.calendar?.view.type === "dayGridMonth") {
+      for (const cell of root.querySelectorAll<HTMLElement>(
+        ".fc-daygrid-day[data-date]"
+      )) {
+        const container = this._dayCellContainer(cell);
+        if (container) {
+          this._fillAlternateContainer(container, cell.dataset.date!);
+        }
+      }
+      // The month header shows weekday names, not dates.
+      root
+        .querySelectorAll<HTMLElement>(
+          ".fc-col-header-cell .alternate-day-dates"
+        )
+        .forEach((el) => el.remove());
+      return;
+    }
+    // The column header already carries the date in week and day views.
+    root
+      .querySelectorAll<HTMLElement>(".fc-daygrid-day .alternate-day-dates")
+      .forEach((el) => el.remove());
+    for (const el of root.querySelectorAll<HTMLElement>(
+      ".fc-col-header-cell[data-date], .fc-list-day[data-date]"
+    )) {
+      this._fillDayHeader(el, el.dataset.date!);
+    }
+  }
+
+  /**
+   * Find or create the alternate date container, optionally inserting it at a
+   * specific place instead of appending it.
+   */
+  private _alternateContainer(
+    parent: HTMLElement,
+    insert?: (container: HTMLElement) => void
+  ): HTMLElement {
+    const existing = parent.querySelector<HTMLElement>(".alternate-day-dates");
+    if (existing) {
+      return existing;
+    }
+    const container = document.createElement("div");
+    container.className = "alternate-day-dates";
+    if (insert) {
+      insert(container);
+    } else {
+      parent.appendChild(container);
+    }
+    return container;
+  }
+
+  /**
+   * Apply the dates repeatedly for a short while. FullCalendar mounts the
+   * adjacent-month cells and list rows after the range change settles, so a
+   * single pass misses them.
+   */
+  private _applyAlternateDatesToDomWithRetries(): void {
+    this._clearAlternateDatesRetries();
+    this._applyAlternateDatesToDom();
+    // FullCalendar mounts the adjacent-month cells and list rows after the
+    // range change settles, so re-apply once the DOM is stable. The later pass
+    // covers slower devices where the cells arrive after the first retry.
+    this._alternateDatesRetryTimeouts = [120, 500].map((delay) =>
+      window.setTimeout(() => this._applyAlternateDatesToDom(), delay)
+    );
+  }
+
+  private _clearAlternateDatesRetries(): void {
+    for (const timeout of this._alternateDatesRetryTimeouts) {
+      window.clearTimeout(timeout);
+    }
+    this._alternateDatesRetryTimeouts = [];
+  }
+
+  /**
+   * Create the alternate date container inside a month cell, placed directly
+   * below the day number rather than beside it.
+   */
+  private _dayCellContainer(cell: HTMLElement): HTMLElement | undefined {
+    const frame = cell.querySelector<HTMLElement>(".fc-daygrid-day-frame");
+    if (!frame) {
+      return undefined;
+    }
+    return this._alternateContainer(frame, (container) => {
+      const top = frame.querySelector<HTMLElement>(".fc-daygrid-day-top");
+      if (top) {
+        top.after(container);
+      } else {
+        frame.prepend(container);
+      }
+    });
+  }
+
+  private _fillAlternateContainer(
+    container: HTMLElement,
+    dateKey: string,
+    showDisplayName = false
+  ): void {
+    const enabled = this.alternateCalendarTypes;
+    const visible = (this._alternateDateCache[dateKey] ?? []).filter(
+      (date) => !enabled || enabled.includes(date.calendar_type)
+    );
+    if (!visible.length) {
+      container.replaceChildren();
+      return;
+    }
+    container.replaceChildren(
+      ...visible.map((date) => {
+        const label = document.createElement("span");
+        label.className = "alternate-day-date";
+        label.textContent = showDisplayName
+          ? date.display_name
+          : this._formatAlternateDate(date);
+        const calendarName = this._alternateCalendarNames[date.calendar_type];
+        if (calendarName) {
+          label.title = calendarName;
+        }
+        return label;
+      })
+    );
+  }
+
+  /**
+   * Append the alternate calendar dates of a day cell below the day number
+   * that FullCalendar has already rendered, so the day number stays intact.
+   */
+  private _appendAlternateDayCellDate(arg: DayCellMountArg): void {
+    // Week and day views label the column header instead.
+    if (arg.view.type !== "dayGridMonth") {
+      return;
+    }
+    const container = this._dayCellContainer(arg.el);
+    if (container) {
+      this._fillAlternateContainer(container, this._dateKey(arg.date));
+    }
+  }
+
+  /**
+   * Append the alternate calendar dates of a day header below the header text
+   * that FullCalendar has already rendered. The month view header shows day
+   * names rather than day numbers, so it is skipped there.
+   */
+  private _appendAlternateDayHeaderDate(arg: DayHeaderMountArg): void {
+    if (arg.view.type !== "dayGridMonth") {
+      this._fillDayHeader(arg.el, this._dateKey(arg.date));
+    }
+  }
+
+  /**
+   * Fill the alternate dates into a week/day column header or a list day row.
+   */
+  private _fillDayHeader(el: HTMLElement, dateKey: string): void {
+    const cushion = el.querySelector<HTMLElement>(
+      ".fc-col-header-cell-cushion, .fc-list-day-cushion"
+    );
+    if (cushion) {
+      this._fillAlternateContainer(
+        this._alternateContainer(cushion),
+        dateKey,
+        cushion.classList.contains("fc-list-day-cushion")
+      );
+    }
+  }
+
+  private _dateKey(date: Date): string {
+    const year = date.getFullYear();
+    const month = `${date.getMonth() + 1}`.padStart(2, "0");
+    const day = `${date.getDate()}`.padStart(2, "0");
+    return `${year}-${month}-${day}`;
+  }
+
+  private _formatAlternateDate(date: AlternateDate): string {
+    const metadata = (date.metadata ?? {}) as {
+      hijri_day?: number;
+      hijri_month?: number;
+      month_name?: string;
+    };
+    const { hijri_day, hijri_month } = metadata;
+    const hasHijri = hijri_day != null && hijri_month != null;
+    // date_str is the alternate calendar's ISO date, e.g. "1448-09-01".
+    const parts = date.date_str.split("-");
+    const numberAt = (index: number) =>
+      parts.length >= 3 ? `${parseInt(parts[index], 10)}` : "";
+    const day = hasHijri ? `${hijri_day}` : numberAt(2) || date.date_str;
+    const month = hasHijri ? `${hijri_month}` : numberAt(1);
+    const monthName =
+      metadata.month_name || date.display_name.split(" ")[1] || "";
+    if (this.alternateCalendarFormat === "d_month" && monthName) {
+      // Keep the first word so non-Latin month names are not cut mid-character.
+      return `(${day} ${monthName.split(" ")[0].replace(/\.$/, "")})`;
+    }
+    return `(${day}/${month})`;
   }
 
   private _viewToggleButtons = memoize((views, localize: LocalizeFunc) => {
@@ -771,6 +1064,54 @@ export class HAFullCalendar extends LitElement {
 
         .fc-daygrid-block-event .fc-event-main {
           padding: 0 1px;
+        }
+
+        .alternate-day-dates {
+          display: flex;
+          flex-direction: column;
+          align-items: center;
+          line-height: 1.2;
+          font-size: 0.78em;
+          font-weight: var(--ha-font-weight-normal);
+          opacity: 0.8;
+          white-space: nowrap;
+          padding-bottom: 2px;
+        }
+
+        /* Match the Gregorian day label in week and day views: the container
+           sits inside .fc-col-header-cell-cushion, so inherit its size, weight,
+           colour and line height. */
+        .fc-col-header-cell .alternate-day-dates {
+          margin-top: 1px;
+          font-size: inherit;
+          font-weight: inherit;
+          line-height: inherit;
+          opacity: 1;
+        }
+
+        .fc-col-header-cell .alternate-day-date {
+          font-weight: inherit;
+        }
+
+        /* Keep the list label on its own line below the date without adding
+           row height beyond the text itself. */
+        .fc-list-day-cushion .alternate-day-dates {
+          display: block;
+          clear: both;
+          font-size: var(--ha-font-size-m);
+          line-height: 1.2;
+          text-align: right;
+        }
+
+        .alternate-day-date {
+          display: block;
+        }
+
+        /* The day number lives in .fc-daygrid-day-top, which FullCalendar dims
+           for adjacent-month cells. The alternate dates sit outside it, so
+           mirror the same dimming to keep the cells consistent. */
+        .fc-day-other .alternate-day-dates {
+          opacity: 0.3;
         }
 
         .tentative {

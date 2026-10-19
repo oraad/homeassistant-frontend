@@ -1,4 +1,4 @@
-import { mdiCalendarClock } from "@mdi/js";
+import { mdiCalendarClock, mdiCalendarSync } from "@mdi/js";
 import { TZDate } from "@date-fns/tz";
 import { addDays, isSameDay } from "date-fns";
 import type { CSSResultGroup } from "lit";
@@ -105,6 +105,8 @@ class DialogCalendarEventDetail extends LitElement {
             </div>
           </div>
 
+          ${this._renderAlternateDates()}
+
           <div class="attribute">
             <state-info
               .hass=${this.hass}
@@ -143,6 +145,27 @@ class DialogCalendarEventDetail extends LitElement {
           }
         </ha-dialog-footer>
       </ha-dialog>
+    `;
+  }
+
+  private _renderAlternateDates() {
+    const alternateDates = this._params?.entry?.alternate_dates;
+    if (!alternateDates?.length) {
+      return nothing;
+    }
+    return html`
+      <div class="field alternate-dates">
+        ${alternateDates.map(
+          (date) =>
+            html`<div class="alternate-date">
+              <ha-svg-icon
+                class="alternate-date-icon"
+                .path=${mdiCalendarSync}
+              ></ha-svg-icon>
+              <span class="alternate-date-value">${date.display_name}</span>
+            </div>`
+        )}
+      </div>
     `;
   }
 
@@ -280,6 +303,30 @@ class DialogCalendarEventDetail extends LitElement {
           max-width: 300px;
           overflow-wrap: break-word;
           white-space: pre-line;
+        }
+        .alternate-dates {
+          display: flex;
+          flex-direction: column;
+          gap: var(--ha-space-1);
+          margin-top: var(--ha-space-2);
+        }
+        .alternate-date {
+          display: flex;
+          align-items: center;
+          gap: var(--ha-space-2);
+          font-size: var(--ha-font-size-m);
+          line-height: var(--ha-line-height-normal);
+        }
+        .alternate-date-icon {
+          flex: none;
+          width: 18px;
+          height: 18px;
+          margin: 0;
+          color: var(--secondary-text-color);
+        }
+        .alternate-date-value {
+          color: var(--primary-text-color);
+          font-weight: var(--ha-font-weight-medium);
         }
       `,
     ];
